@@ -559,15 +559,19 @@ async def search_duckduckgo_browser(
     page = await context.new_page()
     try:
         page.set_default_timeout(timeout * 1000)
-        await page.goto(url, wait_until="domcontentloaded")
+        LOGGER.info("🌐 Browser: Searching for '%s'", query)
+        await page.goto(url, wait_until="load")
+        await asyncio.sleep(1.0)
         html = await page.content()
+        LOGGER.info("✓ Browser: Search page loaded")
     except Exception as exc:
-        LOGGER.warning("Browser search failed for %s: %s", url, exc)
+        LOGGER.warning("✗ Browser search failed for %s: %s", url, exc)
         return []
     finally:
         await page.close()
 
     urls = parse_search_results(html)
+    LOGGER.info("  Found %d links in search results", len(urls))
     seen: Set[str] = set()
     filtered: List[str] = []
     for candidate in urls:
@@ -577,6 +581,7 @@ async def search_duckduckgo_browser(
         filtered.append(candidate)
         if len(filtered) >= limit:
             break
+    LOGGER.info("  Filtered to %d results", len(filtered))
     return filtered
 
 
@@ -588,17 +593,21 @@ async def fetch_page_data_browser(
 ) -> Optional[PageData]:
     page = await context.new_page()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        LOGGER.info("  → Fetching: %s", url[:100])
+        await page.goto(url, wait_until="load", timeout=timeout * 1000)
+        await asyncio.sleep(0.5)
         text = await page.evaluate("() => document.body ? document.body.innerText : ''")
         hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(a => a.href)")
+        LOGGER.info("    ✓ Loaded: %d chars, %d links found", len(text or ""), len(hrefs or []))
     except Exception as exc:
-        LOGGER.warning("Browser fetch failed for %s: %s", url, exc)
+        LOGGER.warning("    ✗ Failed: %s", str(exc)[:80])
         return None
     finally:
         await page.close()
 
     cleaned_text = clean_text(text or "")
     if len(cleaned_text) < min_text_len:
+        LOGGER.debug("    ⊘ Text too short (%d < %d), skipping", len(cleaned_text), min_text_len)
         return None
     links: List[str] = []
     for href in hrefs or []:
@@ -755,20 +764,25 @@ async def extract_symptoms_from_texts(
     rows: List[Dict[str, object]] = []
 
     for idx, chunk in enumerate(chunks, start=1):
-        LOGGER.info("OpenRouter extraction chunk %s/%s", idx, len(chunks))
+        LOGGER.info("🤖 AI: Analyzing chunk %d/%d (%d chars)", idx, len(chunks), len(chunk))
         prompt = build_prompt(disease_en, chunk)
         response_text = await call_openrouter(
             session, api_key, model, prompt, timeout, max_retries
         )
         if not response_text:
+            LOGGER.warning("  ✗ No response from AI")
             continue
         data = parse_json_from_text(response_text)
+        count = 0
         if isinstance(data, list):
             for item in data:
                 if isinstance(item, dict):
                     rows.append(item)
+                    count += 1
         elif isinstance(data, dict):
             rows.append(data)
+            count += 1
+        LOGGER.info("  ✓ Extracted %d symptoms", count)
     return rows
 
 
@@ -856,7 +870,9 @@ async def run_agent(args: argparse.Namespace) -> None:
 
             disease_bn = ""
             for query in search_queries:
-                LOGGER.info("Search query: %s", query)
+                LOGGER.info("\n" + "="*60)
+                LOGGER.info("🔍 Query: %s", query)
+                LOGGER.info("="*60)
                 if args.fetch_mode == "browser":
                     seed_urls = await search_duckduckgo_browser(
                         browser_context,
@@ -901,8 +917,10 @@ async def run_agent(args: argparse.Namespace) -> None:
                         args.min_text_len,
                     )
                 if not pages:
+                    LOGGER.warning("  No pages successfully fetched")
                     continue
 
+                LOGGER.info("📄 Fetched %d pages, extracting text...", len(pages))
                 texts = [page.text for page in pages]
                 raw_rows = await extract_symptoms_from_texts(
                     session,
@@ -915,15 +933,20 @@ async def run_agent(args: argparse.Namespace) -> None:
                     args.max_retries,
                 )
                 if not raw_rows:
+                    LOGGER.warning("  AI extraction failed or returned no results")
                     continue
 
+                LOGGER.info("📊 Raw rows: %d", len(raw_rows))
                 if not disease_bn:
                     disease_bn = choose_disease_bn(raw_rows)
                 normalized = normalize_rows(raw_rows, disease_en, disease_bn)
                 all_rows.extend(normalized)
                 all_rows = dedupe_rows(all_rows)
 
-                if get_unique_symptom_count(all_rows) >= args.min_symptoms:
+                unique_count = get_unique_symptom_count(all_rows)
+                LOGGER.info("✓ Total symptoms collected: %d/%d", unique_count, args.min_symptoms)
+                if unique_count >= args.min_symptoms:
+                    LOGGER.info("✓ Target reached! Stopping collection.")
                     break
 
             if not all_rows:
@@ -954,8 +977,11 @@ async def run_agent(args: argparse.Namespace) -> None:
     output_path = os.path.join(args.output_dir, args.output_file)
     append_csv(output_path, all_rows)
 
-    LOGGER.info("Appended CSV: %s", output_path)
-    LOGGER.info("Rows added: %s", len(all_rows))
+    LOGGER.info("\n" + "="*60)
+    LOGGER.info("✅ SUCCESS!")
+    LOGGER.info("  Saved: %s", output_path)
+    LOGGER.info("  Total rows: %d", len(all_rows))
+    LOGGER.info("="*60 + "\n")
 
 
 def prompt_for_args() -> argparse.Namespace:
