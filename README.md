@@ -28,6 +28,12 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
+Install Playwright browser binaries (Edge channel):
+
+```powershell
+python -m playwright install msedge
+```
+
 Set your OpenRouter API key:
 
 CMD:
@@ -40,7 +46,7 @@ PowerShell:
 $env:OPENROUTER_API_KEY="YOUR_KEY"
 ```
 
-Run the agent:
+Run the agent (it will prompt for headless vs visible browser):
 
 ```powershell
 python symptom_dataset_agent.py "fever"
@@ -61,13 +67,19 @@ Install dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-Set your API key:
+Install Playwright browser binaries (Edge channel):
+
+```bash
+python3 -m playwright install msedge
+```
+
+Set your OpenRouter API key:
 
 ```bash
 export OPENROUTER_API_KEY="YOUR_KEY"
 ```
 
-Run the agent:
+Run the agent (it will prompt for headless vs visible browser):
 
 ```bash
 python symptom_dataset_agent.py "fever"
@@ -105,11 +117,15 @@ Notes:
 | `--output-dir` | . | Output folder |
 | `--output-file` | adata.csv | Output CSV filename |
 | `--model` | tencent/hy3-preview:free | OpenRouter model id |
+| `--fetch-mode` | browser | Use Playwright browser or direct HTTP |
+| `--browser-mode` | ask | Ask/headless/headed browser mode |
+| `--browser-engine` | chromium | Playwright engine |
+| `--browser-channel` | msedge | Chromium channel |
 
 Example:
 
 ```bash
-python symptom_dataset_agent.py "asthma" --min-symptoms 30 --max-pages 30
+python symptom_dataset_agent.py "asthma" --min-symptoms 30 --max-pages 30 --browser-mode headless
 ```
 
 ## Tips

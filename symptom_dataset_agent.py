@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import sys
 from collections import Counter, deque
 from dataclasses import dataclass
 from html import unescape
@@ -21,6 +22,12 @@ except ModuleNotFoundError as exc:
     raise RuntimeError(
         "Missing dependency 'aiohttp'. Install with: pip install -r requirements.txt"
     ) from exc
+
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+except ModuleNotFoundError:
+    async_playwright = None
+    PlaywrightTimeoutError = None
 
 USER_AGENTS = [
     (
@@ -160,6 +167,27 @@ def clean_text(text: str) -> str:
     text = normalize_whitespace(text)
     text = re.sub(r"\s*\|\s*", " | ", text)
     return text.strip()
+
+
+def ensure_playwright() -> None:
+    if async_playwright is None:
+        raise RuntimeError(
+            "Missing dependency 'playwright'. Install with: pip install -r requirements.txt "
+            "and run: playwright install msedge"
+        )
+
+
+def resolve_browser_mode(mode: str) -> bool:
+    if mode == "headless":
+        return True
+    if mode == "headed":
+        return False
+    if not sys.stdin.isatty():
+        return True
+    answer = input("Run browser headless? [Y/n]: ").strip().lower()
+    if answer in {"n", "no", "headed", "visible"}:
+        return False
+    return True
 
 
 def normalize_action_text(value: object) -> str:
@@ -521,6 +549,122 @@ async def crawl(
     return pages
 
 
+async def search_duckduckgo_browser(
+    context,
+    query: str,
+    limit: int,
+    timeout: int,
+) -> List[str]:
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    page = await context.new_page()
+    try:
+        page.set_default_timeout(timeout * 1000)
+        await page.goto(url, wait_until="domcontentloaded")
+        html = await page.content()
+    except Exception as exc:
+        LOGGER.warning("Browser search failed for %s: %s", url, exc)
+        return []
+    finally:
+        await page.close()
+
+    urls = parse_search_results(html)
+    seen: Set[str] = set()
+    filtered: List[str] = []
+    for candidate in urls:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        filtered.append(candidate)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
+async def fetch_page_data_browser(
+    context,
+    url: str,
+    timeout: int,
+    min_text_len: int,
+) -> Optional[PageData]:
+    page = await context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(a => a.href)")
+    except Exception as exc:
+        LOGGER.warning("Browser fetch failed for %s: %s", url, exc)
+        return None
+    finally:
+        await page.close()
+
+    cleaned_text = clean_text(text or "")
+    if len(cleaned_text) < min_text_len:
+        return None
+    links: List[str] = []
+    for href in hrefs or []:
+        if not href:
+            continue
+        resolved = urljoin(url, href)
+        if not is_valid_url(resolved):
+            continue
+        normalized = normalize_url(resolved)
+        if is_probably_binary(normalized):
+            continue
+        links.append(normalized)
+    return PageData(url=url, text=cleaned_text, links=links, score=domain_score(url))
+
+
+async def crawl_browser(
+    context,
+    seed_urls: List[str],
+    max_pages: int,
+    max_depth: int,
+    concurrency: int,
+    timeout: int,
+    min_text_len: int,
+) -> List[PageData]:
+    queue: deque[Tuple[str, int]] = deque((url, 0) for url in seed_urls)
+    visited: Set[str] = set()
+    pages: List[PageData] = []
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def guarded_fetch(url: str, depth: int) -> Tuple[str, int, Optional[PageData]]:
+        async with semaphore:
+            data = await fetch_page_data_browser(context, url, timeout, min_text_len)
+            return url, depth, data
+
+    while queue and len(pages) < max_pages:
+        batch: List[Tuple[str, int]] = []
+        while queue and len(batch) < concurrency and len(pages) + len(batch) < max_pages:
+            url, depth = queue.popleft()
+            if url in visited:
+                continue
+            visited.add(url)
+            batch.append((url, depth))
+
+        tasks = [guarded_fetch(url, depth) for url, depth in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            url, depth, page = result
+            if not page:
+                continue
+            pages.append(page)
+            if depth >= max_depth:
+                continue
+            candidates = prioritize_urls(page.links)
+            for link in candidates[:20]:
+                if link in visited:
+                    continue
+                if domain_score(link) < 0:
+                    continue
+                queue.append((link, depth + 1))
+
+    return pages
+
+
 async def call_openrouter(
     session: aiohttp.ClientSession,
     api_key: str,
@@ -672,77 +816,140 @@ async def run_agent(args: argparse.Namespace) -> None:
     all_rows: List[Dict[str, object]] = []
     seen_urls: Set[str] = set()
 
+    playwright = None
+    browser = None
+    browser_context = None
+
     async with aiohttp.ClientSession(
         max_line_size=MAX_HEADER_LINE,
         max_field_size=MAX_HEADER_FIELD,
     ) as session:
-        disease_bn = ""
-        for query in search_queries:
-            LOGGER.info("Search query: %s", query)
-            seed_urls = await search_duckduckgo(
-                session,
-                query,
-                args.search_limit,
-                args.timeout,
-                args.max_retries,
-            )
-            seed_urls = [url for url in seed_urls if url not in seen_urls]
-            seen_urls.update(seed_urls)
-            prioritized = prioritize_urls(seed_urls)
+        try:
+            if args.fetch_mode == "browser":
+                ensure_playwright()
+                headless = resolve_browser_mode(args.browser_mode)
+                playwright = await async_playwright().start()
+                if args.browser_engine == "firefox":
+                    browser_type = playwright.firefox
+                elif args.browser_engine == "webkit":
+                    browser_type = playwright.webkit
+                else:
+                    browser_type = playwright.chromium
+                channel = (
+                    args.browser_channel
+                    if args.browser_engine == "chromium" and args.browser_channel
+                    else None
+                )
+                try:
+                    browser = await browser_type.launch(headless=headless, channel=channel)
+                except Exception as exc:
+                    if channel:
+                        LOGGER.warning(
+                            "Browser launch failed for channel %s: %s. Retrying without channel.",
+                            channel,
+                            exc,
+                        )
+                        browser = await browser_type.launch(headless=headless)
+                    else:
+                        raise
+                browser_context = await browser.new_context()
 
-            if not prioritized:
-                continue
+            disease_bn = ""
+            for query in search_queries:
+                LOGGER.info("Search query: %s", query)
+                if args.fetch_mode == "browser":
+                    seed_urls = await search_duckduckgo_browser(
+                        browser_context,
+                        query,
+                        args.search_limit,
+                        args.timeout,
+                    )
+                else:
+                    seed_urls = await search_duckduckgo(
+                        session,
+                        query,
+                        args.search_limit,
+                        args.timeout,
+                        args.max_retries,
+                    )
+                seed_urls = [url for url in seed_urls if url not in seen_urls]
+                seen_urls.update(seed_urls)
+                prioritized = prioritize_urls(seed_urls)
 
-            pages = await crawl(
-                session,
-                prioritized,
-                args.max_pages,
-                args.max_depth,
-                args.concurrency,
-                args.timeout,
-                args.max_retries,
-                args.min_text_len,
-            )
-            if not pages:
-                continue
+                if not prioritized:
+                    continue
 
-            texts = [page.text for page in pages]
-            raw_rows = await extract_symptoms_from_texts(
-                session,
-                api_key,
-                args.model,
-                disease_en,
-                texts,
-                args.max_chars,
-                args.timeout,
-                args.max_retries,
-            )
-            if not raw_rows:
-                continue
+                if args.fetch_mode == "browser":
+                    pages = await crawl_browser(
+                        browser_context,
+                        prioritized,
+                        args.max_pages,
+                        args.max_depth,
+                        args.concurrency,
+                        args.timeout,
+                        args.min_text_len,
+                    )
+                else:
+                    pages = await crawl(
+                        session,
+                        prioritized,
+                        args.max_pages,
+                        args.max_depth,
+                        args.concurrency,
+                        args.timeout,
+                        args.max_retries,
+                        args.min_text_len,
+                    )
+                if not pages:
+                    continue
+
+                texts = [page.text for page in pages]
+                raw_rows = await extract_symptoms_from_texts(
+                    session,
+                    api_key,
+                    args.model,
+                    disease_en,
+                    texts,
+                    args.max_chars,
+                    args.timeout,
+                    args.max_retries,
+                )
+                if not raw_rows:
+                    continue
+
+                if not disease_bn:
+                    disease_bn = choose_disease_bn(raw_rows)
+                normalized = normalize_rows(raw_rows, disease_en, disease_bn)
+                all_rows.extend(normalized)
+                all_rows = dedupe_rows(all_rows)
+
+                if get_unique_symptom_count(all_rows) >= args.min_symptoms:
+                    break
+
+            if not all_rows:
+                LOGGER.warning(
+                    "No symptom data extracted. Try increasing limits or queries."
+                )
+                return
 
             if not disease_bn:
-                disease_bn = choose_disease_bn(raw_rows)
-            normalized = normalize_rows(raw_rows, disease_en, disease_bn)
-            all_rows.extend(normalized)
-            all_rows = dedupe_rows(all_rows)
-
-            if get_unique_symptom_count(all_rows) >= args.min_symptoms:
-                break
-
-        if not all_rows:
-            raise RuntimeError("No symptom data extracted. Try increasing limits or queries.")
-
-        if not disease_bn:
-            disease_bn = await translate_disease_name(
-                session,
-                api_key,
-                args.model,
-                disease_en,
-                args.timeout,
-                args.max_retries,
-            )
-            all_rows = normalize_rows(all_rows, disease_en, disease_bn)
-            all_rows = dedupe_rows(all_rows)
+                disease_bn = await translate_disease_name(
+                    session,
+                    api_key,
+                    args.model,
+                    disease_en,
+                    args.timeout,
+                    args.max_retries,
+                )
+                all_rows = normalize_rows(all_rows, disease_en, disease_bn)
+                all_rows = dedupe_rows(all_rows)
+        finally:
+            if browser_context:
+                await browser_context.close()
+            if browser:
+                await browser.close()
+            if playwright:
+                await playwright.stop()
 
     output_path = os.path.join(args.output_dir, args.output_file)
     append_csv(output_path, all_rows)
@@ -773,6 +980,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=3, help="Retry count")
     parser.add_argument("--min-text-len", type=int, default=500, help="Min page text length")
     parser.add_argument("--output-file", default="adata.csv", help="Output CSV filename")
+    parser.add_argument(
+        "--fetch-mode",
+        choices=["browser", "http"],
+        default="browser",
+        help="Use Playwright browser or direct HTTP requests",
+    )
+    parser.add_argument(
+        "--browser-mode",
+        choices=["ask", "headless", "headed"],
+        default="ask",
+        help="Browser visibility mode (ask prompts in terminal)",
+    )
+    parser.add_argument(
+        "--browser-engine",
+        choices=["chromium", "firefox", "webkit"],
+        default="chromium",
+        help="Playwright engine",
+    )
+    parser.add_argument(
+        "--browser-channel",
+        default="msedge",
+        help="Chromium channel (msedge, chrome, or empty)",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
