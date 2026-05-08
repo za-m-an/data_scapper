@@ -958,11 +958,113 @@ async def run_agent(args: argparse.Namespace) -> None:
     LOGGER.info("Rows added: %s", len(all_rows))
 
 
+def prompt_for_args() -> argparse.Namespace:
+    print("\n" + "="*60)
+    print("  Symptom Dataset Agent - Interactive Setup")
+    print("="*60 + "\n")
+
+    disease = input("Enter disease name (e.g., 'Dengue', 'Fever'): ").strip()
+    if not disease:
+        disease = "Dengue"
+    
+    min_symptoms = input(f"Minimum unique symptoms to collect [20]: ").strip()
+    try:
+        min_symptoms = int(min_symptoms) if min_symptoms else 20
+    except ValueError:
+        print("  Invalid input, using default 20")
+        min_symptoms = 20
+
+    max_pages = input(f"Max pages per query [20]: ").strip()
+    try:
+        max_pages = int(max_pages) if max_pages else 20
+    except ValueError:
+        print("  Invalid input, using default 20")
+        max_pages = 20
+
+    max_depth = input(f"Crawler depth [1]: ").strip()
+    try:
+        max_depth = int(max_depth) if max_depth else 1
+    except ValueError:
+        print("  Invalid input, using default 1")
+        max_depth = 1
+
+    search_limit = input(f"Search results per query [10]: ").strip()
+    try:
+        search_limit = int(search_limit) if search_limit else 10
+    except ValueError:
+        print("  Invalid input, using default 10")
+        search_limit = 10
+
+    concurrency = input(f"Concurrent requests [5]: ").strip()
+    try:
+        concurrency = int(concurrency) if concurrency else 5
+    except ValueError:
+        print("  Invalid input, using default 5")
+        concurrency = 5
+
+    print("\nFetch mode:")
+    print("  1) browser - Use Playwright browser (real browser automation)")
+    print("  2) http - Direct HTTP requests (faster)")
+    fetch_mode_choice = input("Choose [1]: ").strip()
+    fetch_mode = "http" if fetch_mode_choice == "2" else "browser"
+
+    if fetch_mode == "browser":
+        print("\nBrowser mode:")
+        print("  1) ask - Ask each time (default)")
+        print("  2) headless - No visible browser")
+        print("  3) headed - Show browser window")
+        browser_mode_choice = input("Choose [1]: ").strip()
+        browser_mode_map = {"1": "ask", "2": "headless", "3": "headed"}
+        browser_mode = browser_mode_map.get(browser_mode_choice, "ask")
+    else:
+        browser_mode = "ask"
+
+    browser_engine = input("Browser engine (chromium/firefox/webkit) [chromium]: ").strip()
+    browser_engine = browser_engine if browser_engine in {"chromium", "firefox", "webkit"} else "chromium"
+
+    browser_channel = input("Browser channel (msedge/chrome or blank) [msedge]: ").strip()
+    browser_channel = browser_channel or "msedge"
+
+    model = input("OpenRouter model [tencent/hy3-preview:free]: ").strip()
+    model = model or "tencent/hy3-preview:free"
+
+    output_file = input("Output CSV filename [adata.csv]: ").strip()
+    output_file = output_file or "adata.csv"
+
+    output_dir = input("Output directory [.]: ").strip()
+    output_dir = output_dir or "."
+
+    print("\n" + "="*60 + "\n")
+
+    args = argparse.Namespace(
+        disease=disease,
+        api_key=None,
+        output_dir=output_dir,
+        min_symptoms=min_symptoms,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        search_limit=search_limit,
+        concurrency=concurrency,
+        max_chars=6000,
+        timeout=25,
+        max_retries=3,
+        min_text_len=500,
+        output_file=output_file,
+        fetch_mode=fetch_mode,
+        browser_mode=browser_mode,
+        browser_engine=browser_engine,
+        browser_channel=browser_channel,
+        model=model,
+        log_level="INFO",
+    )
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate symptom severity dataset using web crawl + OpenRouter."
     )
-    parser.add_argument("disease", help="Disease name in English, e.g., 'fever'")
+    parser.add_argument("disease", nargs="?", help="Disease name in English, e.g., 'fever'")
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
     parser.add_argument(
         "--model",
@@ -1008,7 +1110,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
+    if len(sys.argv) > 1:
+        args = parse_args()
+        if not args.disease:
+            print("Error: disease name required when using command-line arguments")
+            sys.exit(1)
+    else:
+        args = prompt_for_args()
     configure_logging(args.log_level)
     try:
         asyncio.run(run_agent(args))

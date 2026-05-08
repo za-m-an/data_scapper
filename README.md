@@ -13,6 +13,8 @@ Generate a structured symptom severity dataset for any disease. The agent search
 
 Use a virtual environment (recommended). If you prefer the global environment, skip the venv steps.
 
+The script runs in **interactive mode** by default — just run it and it will prompt for all settings!
+
 ### Windows
 
 Create and activate a venv:
@@ -46,10 +48,16 @@ PowerShell:
 $env:OPENROUTER_API_KEY="YOUR_KEY"
 ```
 
-Run the agent (it will prompt for headless vs visible browser):
+Run the agent (interactive - it will prompt for all settings):
 
 ```powershell
-python symptom_dataset_agent.py "fever"
+python symptom_dataset_agent.py
+```
+
+Or use command-line flags to skip interactive prompts:
+
+```powershell
+python symptom_dataset_agent.py "fever" --browser-mode headless
 ```
 
 ### Linux (and macOS)
@@ -79,10 +87,16 @@ Set your OpenRouter API key:
 export OPENROUTER_API_KEY="YOUR_KEY"
 ```
 
-Run the agent (it will prompt for headless vs visible browser):
+Run the agent (interactive - it will prompt for all settings):
 
 ```bash
-python symptom_dataset_agent.py "fever"
+python symptom_dataset_agent.py
+```
+
+Or use command-line flags to skip interactive prompts:
+
+```bash
+python symptom_dataset_agent.py "fever" --browser-mode headless
 ```
 
 The output CSV is appended to `adata.csv` in the current folder and written as UTF-8 with BOM for Excel compatibility.
@@ -130,6 +144,8 @@ python symptom_dataset_agent.py "asthma" --min-symptoms 30 --max-pages 30 --brow
 
 ## Tips
 
+- Just run `python symptom_dataset_agent.py` to use interactive mode—no flags needed!
+- If you prefer command-line, use flags like `python symptom_dataset_agent.py "heart attack" --min-symptoms 25`
 - Use quotes for multi-word diseases, e.g., `"heart failure"`.
 - If results are sparse, increase `--max-pages` or `--search-limit`.
 - You can pass the API key directly with `--api-key` instead of the env var.
