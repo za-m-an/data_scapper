@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import csv
@@ -13,7 +15,12 @@ from html.parser import HTMLParser
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
-import aiohttp
+try:
+    import aiohttp
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "Missing dependency 'aiohttp'. Install with: pip install -r requirements.txt"
+    ) from exc
 
 USER_AGENTS = [
     (
@@ -63,6 +70,24 @@ SEVERITY_LABELS = {
     4: "severe",
     5: "critical",
 }
+
+UTF8_BOM = b"\xef\xbb\xbf"
+
+CSV_FIELDS = [
+    "disease_bn",
+    "disease_en",
+    "symptom_bn",
+    "symptom_en",
+    "severity_level",
+    "severity_label",
+    "action_mild_bn",
+    "action_mild_en",
+    "action_severe_bn",
+    "action_severe_en",
+]
+
+MAX_HEADER_LINE = 16384
+MAX_HEADER_FIELD = 16384
 
 IGNORE_TAGS = {"script", "style", "noscript", "svg"}
 
@@ -135,6 +160,29 @@ def clean_text(text: str) -> str:
     text = normalize_whitespace(text)
     text = re.sub(r"\s*\|\s*", " | ", text)
     return text.strip()
+
+
+def normalize_action_text(value: object) -> str:
+    return clean_text(str(value or "")).strip()
+
+
+def ensure_utf8_bom(path: str) -> None:
+    try:
+        with open(path, "rb") as handle:
+            start = handle.read(3)
+            if start == UTF8_BOM:
+                return
+        temp_path = f"{path}.tmp"
+        with open(path, "rb") as src, open(temp_path, "wb") as dst:
+            dst.write(UTF8_BOM)
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        os.replace(temp_path, path)
+    except OSError as exc:
+        LOGGER.warning("Failed to add UTF-8 BOM to %s: %s", path, exc)
 
 
 def is_valid_url(url: str) -> bool:
@@ -223,6 +271,10 @@ def normalize_rows(rows: List[Dict[str, object]], disease_en: str, disease_bn: s
             continue
         label = str(row.get("severity_label", "")).strip().lower()
         label = SEVERITY_LABELS.get(level, label)
+        action_mild_bn = normalize_action_text(row.get("action_mild_bn", ""))
+        action_mild_en = normalize_action_text(row.get("action_mild_en", ""))
+        action_severe_bn = normalize_action_text(row.get("action_severe_bn", ""))
+        action_severe_en = normalize_action_text(row.get("action_severe_en", ""))
         normalized.append(
             {
                 "disease_bn": str(row.get("disease_bn", "") or disease_bn).strip(),
@@ -231,6 +283,10 @@ def normalize_rows(rows: List[Dict[str, object]], disease_en: str, disease_bn: s
                 "symptom_en": symptom_en,
                 "severity_level": level,
                 "severity_label": label,
+                "action_mild_bn": action_mild_bn,
+                "action_mild_en": action_mild_en,
+                "action_severe_bn": action_severe_bn,
+                "action_severe_en": action_severe_en,
             }
         )
     return normalized
@@ -291,10 +347,14 @@ def build_prompt(disease_en: str, text: str) -> str:
         "You are a medical data extractor. Based ONLY on the provided text, "
         "extract symptoms for the disease and classify each symptom into one "
         "severity level. Output JSON ONLY as an array of objects with keys: "
-        "disease_bn, disease_en, symptom_bn, symptom_en, severity_level, severity_label. "
+        "disease_bn, disease_en, symptom_bn, symptom_en, severity_level, severity_label, "
+        "action_mild_bn, action_mild_en, action_severe_bn, action_severe_en. "
         "Rules: severity_level must be 1-5, severity_label must be one of "
         "mild, normal, moderate, severe, critical. Provide Bangla text first "
         "then English. Normalize duplicates and synonyms. Avoid non-symptoms. "
+        "action_mild = what to do if symptoms are mild/light. "
+        "action_severe = what to do if symptoms are severe or critical. "
+        "Keep actions short, general, and safe (no dosages or prescriptions). "
         f"Disease (English): {disease_en}.\n\n"
         "Text:\n"
         f"{text}"
@@ -461,19 +521,27 @@ async def crawl(
     return pages
 
 
-async def call_gemini(
+async def call_openrouter(
     session: aiohttp.ClientSession,
     api_key: str,
+    model: str,
     prompt: str,
     timeout: int,
     max_retries: int,
 ) -> Optional[str]:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 2048,
     }
-    headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "https://localhost",
+        "X-Title": "symptom-dataset-agent",
+    }
 
     for attempt in range(max_retries):
         try:
@@ -492,16 +560,17 @@ async def call_gemini(
                         headers=response.headers,
                     )
                 data = await response.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
+                choices = data.get("choices", [])
+                if not choices:
                     return None
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if not parts:
+                message = choices[0].get("message", {})
+                content = message.get("content")
+                if not content:
                     return None
-                return parts[0].get("text")
+                return content
         except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             if attempt == max_retries - 1:
-                LOGGER.warning("Gemini request failed: %s", exc)
+                LOGGER.warning("OpenRouter request failed: %s", exc)
                 return None
             sleep_for = (0.6 * (2**attempt)) + random.uniform(0.0, 0.2)
             await asyncio.sleep(sleep_for)
@@ -511,12 +580,15 @@ async def call_gemini(
 async def translate_disease_name(
     session: aiohttp.ClientSession,
     api_key: str,
+    model: str,
     disease_en: str,
     timeout: int,
     max_retries: int,
 ) -> str:
     prompt = build_disease_translation_prompt(disease_en)
-    response_text = await call_gemini(session, api_key, prompt, timeout, max_retries)
+    response_text = await call_openrouter(
+        session, api_key, model, prompt, timeout, max_retries
+    )
     if not response_text:
         return ""
     data = parse_json_from_text(response_text)
@@ -528,6 +600,7 @@ async def translate_disease_name(
 async def extract_symptoms_from_texts(
     session: aiohttp.ClientSession,
     api_key: str,
+    model: str,
     disease_en: str,
     texts: List[str],
     max_chars: int,
@@ -538,9 +611,11 @@ async def extract_symptoms_from_texts(
     rows: List[Dict[str, object]] = []
 
     for idx, chunk in enumerate(chunks, start=1):
-        LOGGER.info("Gemini extraction chunk %s/%s", idx, len(chunks))
+        LOGGER.info("OpenRouter extraction chunk %s/%s", idx, len(chunks))
         prompt = build_prompt(disease_en, chunk)
-        response_text = await call_gemini(session, api_key, prompt, timeout, max_retries)
+        response_text = await call_openrouter(
+            session, api_key, model, prompt, timeout, max_retries
+        )
         if not response_text:
             continue
         data = parse_json_from_text(response_text)
@@ -553,20 +628,17 @@ async def extract_symptoms_from_texts(
     return rows
 
 
-def write_csv(output_path: str, rows: List[Dict[str, object]]) -> None:
-    with open(output_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "disease_bn",
-                "disease_en",
-                "symptom_bn",
-                "symptom_en",
-                "severity_level",
-                "severity_label",
-            ],
-        )
-        writer.writeheader()
+def append_csv(output_path: str, rows: List[Dict[str, object]]) -> None:
+    file_exists = os.path.exists(output_path)
+    write_header = not file_exists or os.path.getsize(output_path) == 0
+    if file_exists and not write_header:
+        ensure_utf8_bom(output_path)
+    mode = "w" if write_header else "a"
+    encoding = "utf-8-sig" if write_header else "utf-8"
+    with open(output_path, mode, newline="", encoding=encoding) as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
 
 
@@ -589,16 +661,21 @@ def choose_disease_bn(rows: List[Dict[str, object]]) -> str:
 
 
 async def run_agent(args: argparse.Namespace) -> None:
-    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
-        raise RuntimeError("Gemini API key missing. Use --api-key or GEMINI_API_KEY env var.")
+        raise RuntimeError(
+            "OpenRouter API key missing. Use --api-key or OPENROUTER_API_KEY env var."
+        )
 
     disease_en = args.disease.strip()
     search_queries = build_search_queries(disease_en)
     all_rows: List[Dict[str, object]] = []
     seen_urls: Set[str] = set()
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        max_line_size=MAX_HEADER_LINE,
+        max_field_size=MAX_HEADER_FIELD,
+    ) as session:
         disease_bn = ""
         for query in search_queries:
             LOGGER.info("Search query: %s", query)
@@ -633,6 +710,7 @@ async def run_agent(args: argparse.Namespace) -> None:
             raw_rows = await extract_symptoms_from_texts(
                 session,
                 api_key,
+                args.model,
                 disease_en,
                 texts,
                 args.max_chars,
@@ -658,6 +736,7 @@ async def run_agent(args: argparse.Namespace) -> None:
             disease_bn = await translate_disease_name(
                 session,
                 api_key,
+                args.model,
                 disease_en,
                 args.timeout,
                 args.max_retries,
@@ -665,20 +744,24 @@ async def run_agent(args: argparse.Namespace) -> None:
             all_rows = normalize_rows(all_rows, disease_en, disease_bn)
             all_rows = dedupe_rows(all_rows)
 
-    output_name = sanitize_filename(disease_en) + ".csv"
-    output_path = os.path.join(args.output_dir, output_name)
-    write_csv(output_path, all_rows)
+    output_path = os.path.join(args.output_dir, args.output_file)
+    append_csv(output_path, all_rows)
 
-    LOGGER.info("Saved CSV: %s", output_path)
-    LOGGER.info("Total rows: %s", len(all_rows))
+    LOGGER.info("Appended CSV: %s", output_path)
+    LOGGER.info("Rows added: %s", len(all_rows))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate symptom severity dataset using web crawl + Gemini."
+        description="Generate symptom severity dataset using web crawl + OpenRouter."
     )
     parser.add_argument("disease", help="Disease name in English, e.g., 'fever'")
-    parser.add_argument("--api-key", help="Gemini API key (or set GEMINI_API_KEY)")
+    parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
+    parser.add_argument(
+        "--model",
+        default="tencent/hy3-preview:free",
+        help="OpenRouter model id",
+    )
     parser.add_argument("--output-dir", default=".", help="Output directory")
     parser.add_argument("--min-symptoms", type=int, default=20, help="Target unique symptoms")
     parser.add_argument("--max-pages", type=int, default=20, help="Max pages per query")
@@ -689,6 +772,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=25, help="Request timeout seconds")
     parser.add_argument("--max-retries", type=int, default=3, help="Retry count")
     parser.add_argument("--min-text-len", type=int, default=500, help="Min page text length")
+    parser.add_argument("--output-file", default="adata.csv", help="Output CSV filename")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
